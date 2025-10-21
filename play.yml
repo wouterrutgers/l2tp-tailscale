@@ -1,0 +1,283 @@
+---
+# echo "localhost ansible_connection=local" > hosts
+# sudo ansible-playbook -i hosts play.yml
+- name: L2TP/IPsec always-on + install Tailscale (Ubuntu 24.04)
+  hosts: all
+  become: yes
+
+  vars:
+    l2tp_server: "server.com"
+    ipsec_psk: "psk"
+    l2tp_user: "user"
+    l2tp_pass: "pass"
+    route_all: true
+    health_ping: "8.8.8.8"
+    # ------------------
+
+  pre_tasks:
+    - apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+  tasks:
+    - name: Install VPN deps
+      apt:
+        name:
+          - strongswan
+          - xl2tpd
+          - ppp
+          - iproute2
+          - iptables
+          - iputils-ping
+          - ca-certificates
+        state: present
+
+    - name: Sysctl for L2TP/IPsec routing
+      copy:
+        dest: /etc/sysctl.d/99-l2tp.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.ipv4.conf.all.rp_filter = 0
+          net.ipv4.conf.default.rp_filter = 0
+          net.ipv6.conf.all.forwarding = 1
+      notify: Reload sysctl
+
+    - name: Clamp TCP MSS
+      copy:
+        dest: /usr/local/sbin/iptables-mss-clamp.sh
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+          iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    - command: /usr/local/sbin/iptables-mss-clamp.sh
+
+    # ---------- strongSwan ----------
+    - name: strongSwan ipsec.conf (defines L2TP-PSK)
+      copy:
+        dest: /etc/ipsec.conf
+        content: |
+          config setup
+            charondebug="ike 2, knl 1, cfg 1, net 1"
+
+          conn L2TP-PSK
+            keyexchange=ikev1
+            auto=add
+            authby=psk
+            type=transport
+            left=%defaultroute
+            leftprotoport=17/1701
+            right={{ l2tp_server }}
+            rightprotoport=17/1701
+            rightid=%any
+            ike=aes256-sha2_256-modp2048,aes256-sha256-modp2048,aes256-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024!
+            esp=aes256-sha2_256,aes256-sha256,aes256-sha1,aes128-sha1,3des-sha1!
+            ikelifetime=8h
+            lifetime=1h
+            dpdaction=restart
+            dpddelay=30s
+
+    - name: strongSwan ipsec.secrets
+      copy:
+        dest: /etc/ipsec.secrets
+        mode: '0600'
+        content: |
+          %any {{ l2tp_server }} : PSK "{{ ipsec_psk }}"
+
+    - name: Restart strongSwan
+      systemd:
+        name: strongswan-starter
+        state: restarted
+        enabled: true
+
+    # ---------- xl2tpd ----------
+    - name: xl2tpd.conf
+      copy:
+        dest: /etc/xl2tpd/xl2tpd.conf
+        content: |
+          [global]
+          port = 1701
+          access control = no
+
+    - name: Find pppol2tp plugin path
+      shell: "sh -c 'ls /usr/lib/pppd/*/pppol2tp.so 2>/dev/null | head -n1'"
+      register: pppol2tp_path
+      changed_when: false
+
+    - name: Fail if pppol2tp plugin not found
+      fail:
+        msg: "pppol2tp.so not found under /usr/lib/pppd/*/. Check PPP install."
+      when: pppol2tp_path.stdout == ""
+
+    - name: Disable global auth requirement in ppp
+      lineinfile:
+        path: /etc/ppp/options
+        regexp: '^auth\s*$'
+        state: absent
+
+    - name: PPP options (MS-CHAPv2, plugin path)
+      copy:
+        dest: /etc/ppp/options.l2tpd.client
+        mode: '0600'
+        content: |
+          noauth
+          user "{{ l2tp_user }}"
+          password "{{ l2tp_pass }}"
+          nodeflate
+
+          lcp-echo-interval 5
+          lcp-echo-failure 5
+          mtu 1400
+          mru 1400
+          noipdefault
+          persist
+          maxfail 0
+          usepeerdns
+
+          plugin {{ pppol2tp_path.stdout }}
+          nodefaultroute
+
+    - name: Add chap-secrets entry
+      copy:
+        dest: /etc/ppp/chap-secrets
+        mode: '0600'
+        content: |
+          # Secrets for authentication using CHAP
+          "{{ l2tp_user }}"	*	"{{ l2tp_pass }}"	*
+
+    - name: Enable xl2tpd
+      systemd:
+        name: xl2tpd
+        enabled: true
+        state: restarted
+
+    # ---------- supervisor ----------
+    - name: L2TP supervisor script
+      copy:
+        dest: /usr/local/sbin/l2tp-run.sh
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROUTE_ALL="{{ '1' if route_all else '0' }}"
+          HEALTH="{{ health_ping }}"
+
+          start_ipsec() {
+            systemctl start strongswan-starter || true
+            for i in {1..15}; do ipsec up L2TP-PSK && return 0 || sleep 2; done
+            return 1
+          }
+          start_l2tp() {
+            systemctl restart xl2tpd
+            sleep 2
+            VPN_IP=$(getent hosts {{ l2tp_server }} | awk '{print $1}' | head -1)
+            if [ -n "$VPN_IP" ]; then
+              ip route add $VPN_IP via $(ip route | grep default | head -1 | awk '{print $3}') dev $(ip route | grep default | head -1 | awk '{print $5}') 2>/dev/null || true
+            fi
+            xl2tpd-control add-lac default lns={{ l2tp_server }} pppoptfile=/etc/ppp/options.l2tpd.client 2>/dev/null || true
+            sleep 1
+            xl2tpd-control connect-lac default || true
+          }
+          route_policy() {
+            if [ "$ROUTE_ALL" = "1" ]; then
+              for i in {1..30}; do ip link show ppp0 >/dev/null 2>&1 && break || sleep 1; done
+              ip route replace default dev ppp0 || true
+            fi
+          }
+          health() {
+            ip link show ppp0 >/dev/null 2>&1 && ipsec status >/dev/null 2>&1 || return 1
+            if [ -n "$HEALTH" ]; then ping -c1 -W1 "$HEALTH" >/dev/null 2>&1 || return 1; fi
+            return 0
+          }
+          start_ipsec && start_l2tp && route_policy
+          while true; do
+            if ! health; then
+              ipsec down L2TP-PSK >/dev/null 2>&1 || true
+              start_ipsec && start_l2tp && route_policy
+            fi
+            sleep 5
+          done
+
+    - name: systemd unit for L2TP always-on
+      copy:
+        dest: /etc/systemd/system/l2tp-client.service
+        content: |
+          [Unit]
+          Description=L2TP/IPsec always-on client
+          After=network-online.target strongswan-starter.service xl2tpd.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/sbin/l2tp-run.sh
+          Restart=always
+          RestartSec=3
+          AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+          [Install]
+          WantedBy=multi-user.target
+
+    # ---------- Tailscale (install only) ----------
+    - name: Add Tailscale keyring (Ubuntu 24.04 = noble)
+      get_url:
+        url: https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg
+        dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+        mode: '0644'
+
+    - name: Add Tailscale repo
+      copy:
+        dest: /etc/apt/sources.list.d/tailscale.list
+        content: "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main\n"
+
+    - name: Install Tailscale
+      apt:
+        update_cache: yes
+        name: tailscale
+        state: present
+
+    - name: Enable tailscaled
+      systemd:
+        name: tailscaled
+        enabled: true
+        state: started
+
+    - name: Optimize Tailscale networking (disable GRO)
+      shell: |
+        # Get the main physical interface (not ppp0 or tailscale0)
+        IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$\|^ppp\|^tailscale' | head -1)
+        mkdir -p /etc/networkd-dispatcher/routable.d
+        cat > /etc/networkd-dispatcher/routable.d/50-tailscale <<EOF
+        #!/bin/sh
+        
+        # Optimize physical interface
+        ethtool -K $IFACE rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || true
+        
+        # Optimize ppp0 if it exists
+        if ip link show ppp0 >/dev/null 2>&1; then
+          ethtool -K ppp0 rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || true
+        fi
+        EOF
+        chmod 755 /etc/networkd-dispatcher/routable.d/50-tailscale
+        # Run it now
+        /etc/networkd-dispatcher/routable.d/50-tailscale
+
+    - name: Optimize ppp0 GRO when it comes up
+      copy:
+        dest: /etc/ppp/ip-up.d/tailscale-gro
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          # Optimize UDP GRO for Tailscale on ppp0
+          ethtool -K $1 rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || true
+
+    # ---------- Start VPN (last step) ----------
+    - name: Enable and start supervisor
+      systemd:
+        name: l2tp-client
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+  handlers:
+    - name: Reload sysctl
+      command: sysctl --system
